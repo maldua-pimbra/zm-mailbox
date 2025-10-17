@@ -17,14 +17,17 @@
 
 package com.zimbra.cs.service.account;
 
+import java.net.MalformedURLException;
 import java.util.Map;
 
+import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 
 import com.zimbra.common.auth.ZAuthToken;
 import com.zimbra.common.service.ServiceException;
 import com.zimbra.common.soap.AccountConstants;
 import com.zimbra.common.soap.Element;
+import com.zimbra.common.util.Constants;
 import com.zimbra.common.util.ZimbraLog;
 import com.zimbra.cs.account.Account;
 import com.zimbra.cs.account.AccountServiceException;
@@ -33,6 +36,7 @@ import com.zimbra.cs.account.AuthToken.Usage;
 import com.zimbra.cs.account.Provisioning;
 import com.zimbra.cs.service.AuthProvider;
 import com.zimbra.cs.service.util.ResetPasswordUtil;
+import com.zimbra.cs.servlet.util.CsrfUtil;
 import com.zimbra.soap.JaxbUtil;
 import com.zimbra.soap.SoapServlet;
 import com.zimbra.soap.ZimbraSoapContext;
@@ -59,6 +63,7 @@ public class ResetPassword extends AccountDocumentHandler {
             AuthProvider.validateAuthToken(prov, at, false, Usage.RESET_PASSWORD);
         } else {
             AuthProvider.validateAuthToken(prov, at, false);
+            validateLoggedInCsrf((HttpServletRequest) context.get(SoapServlet.SERVLET_REQUEST), at);
         }
         
         Account acct = at.getAccount();
@@ -123,6 +128,52 @@ public class ResetPassword extends AccountDocumentHandler {
 
     protected void checkPasswordStrength(Provisioning prov, Account acct, String newPassword) throws ServiceException {
         prov.checkPasswordStrength(acct, newPassword);
+    }
+
+    private void validateLoggedInCsrf(HttpServletRequest req, AuthToken authToken) throws ServiceException {
+        if (req == null || authToken == null) {
+            throw ServiceException.FAILURE("Cannot validate CSRF: request or auth token is null", null);
+        }
+
+        Provisioning prov = Provisioning.getInstance();
+        boolean csrfEnabled = prov.getConfig().isCsrfTokenCheckEnabled();
+        boolean refererCheckEnabled = prov.getConfig().isCsrfRefererCheckEnabled();
+
+        // referer check
+        if (refererCheckEnabled) {
+            try {
+                if (!CsrfUtil.isCsrfRequestBasedOnReferrer(req, prov.getConfig().getCsrfAllowedRefererHosts())) {
+                    ZimbraLog.security.warn("CSRF referer check failed for account %s", authToken.getAccountId());
+                    throw ServiceException.PERM_DENIED("CSRF referer check failed: request rejected");
+                }
+            } catch (MalformedURLException e) {
+                ZimbraLog.security.warn("Error during CSRF referer check for account %s: %s",
+                        authToken.getAccountId(), e.getMessage());
+                throw ServiceException.FAILURE("Error during CSRF referer check", e);
+            }
+        }
+
+        // CSRF token check
+        if (csrfEnabled) {
+            // compute boolean first, fail-safe if exception occurs
+            boolean csrfCheckRequired;
+            try {
+                csrfCheckRequired = CsrfUtil.doCsrfCheck(req, authToken);
+            } catch (Exception e) {
+                ZimbraLog.security.warn("Error determining if CSRF check is required for account %s: %s",
+                        authToken.getAccountId(), e.getMessage());
+                csrfCheckRequired = true; // fail-safe
+            }
+
+            // only validate token if required
+            if (csrfCheckRequired) {
+                String csrfToken = req.getHeader(Constants.CSRF_TOKEN);
+                if (!CsrfUtil.isValidCsrfToken(csrfToken, authToken)) {
+                    ZimbraLog.security.warn("CSRF token validation failed for account %s", authToken.getAccountId());
+                    throw ServiceException.PERM_DENIED("CSRF token validation failed: request rejected");
+                }
+            }
+        }
     }
 
     @Override
